@@ -81,7 +81,7 @@ class TopologySignatureLoss(nn.Module):
         Z_tensor = Z_tensor[permutation_indices]
 
         num_batches = (X_tensor.shape[0] + batch_size - 1) // batch_size
-        total_loss = 0.0
+        total_loss = torch.tensor(0.0, device=X_tensor.device)
 
         for i in range(num_batches):
             start_index = i * batch_size
@@ -90,7 +90,7 @@ class TopologySignatureLoss(nn.Module):
             Z_batch = Z_tensor[start_index:end_index]
 
             loss = self.forward(X_batch, Z_batch)
-            total_loss += loss.item()
+            total_loss += loss
 
         return total_loss / num_batches
 
