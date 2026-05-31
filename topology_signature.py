@@ -61,7 +61,9 @@ class TopologySignatureLoss(nn.Module):
         pairs = vietoris_rips_from_matrix(distance_matrix.detach().cpu().numpy(), max_dimension=self.max_dimension)
 
         # Get edge pairs from H0 first. For H0, the birth is always 0, so we only care about the death
-        edge_pairs = [self._traceback_index(point.y, distance_matrix) for point in pairs[0] if point.y != float('inf')]
+        edge_pairs = []
+        if len(pairs) > 0:
+            edge_pairs = [self._traceback_index(point.y, distance_matrix) for point in pairs[0] if point.y != float('inf')]
         
         # Then get edge pairs from H1 to H_dimension
         for dim in range(1, len(pairs)):
