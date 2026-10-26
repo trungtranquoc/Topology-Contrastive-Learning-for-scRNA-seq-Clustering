@@ -1,10 +1,20 @@
 from torch import nn
 import torch
 import numpy as np
-from typing import Optional, Callable
+from typing import Literal, Optional, Callable
 from aleph import vietoris_rips_from_matrix
 from math import prod
-from utils.distance_fn import get_euclidean_distance_matrix
+from utils.distance_fn import get_euclidean_distance_matrix, get_similarity_distance_matrix
+
+import torch.nn.functional as F
+TopologyLossType = Literal["MSE", "Log-Ratio", "Cosine-Log", "Topo-KL"]
+EPS = 1e-6
+T = 1.0
+
+def symmetric_kl(p, q, eps=1e-8):
+    kl_pq = p * torch.log((p + eps) / (q + eps))
+    kl_qp = q * torch.log((q + eps) / (p + eps))
+    return 0.5 * torch.sum(kl_pq + kl_qp)
 
 class TopologySignatureLoss(nn.Module):
     """
@@ -25,13 +35,19 @@ class TopologySignatureLoss(nn.Module):
     """
     max_dimension: int
 
-    def __init__(self, max_dimension: int = 1):
+    def __init__(self, max_dimension: int = 1, loss_type: TopologyLossType = "MSE", distance_type: Literal["euclidean", "similarity"] = "euclidean"):
         
         super(TopologySignatureLoss, self).__init__()
         self.max_dimension = max_dimension
+        self.loss_type = loss_type
 
         # Construct distance matrix function
-        self.dist_matrix_fn = get_euclidean_distance_matrix
+        if distance_type == "euclidean":
+            self.dist_matrix_fn = get_euclidean_distance_matrix
+        elif distance_type == "similarity":
+            self.dist_matrix_fn = get_similarity_distance_matrix
+        else:
+            raise ValueError(f"Invalid distance_type: {distance_type}. Must be 'euclidean' or 'similarity'.")
 
     def _traceback_index(self, edge_distance: float, distance_matrix: np.ndarray) -> tuple[int, int]:
         """Given an edge distance, find the corresponding edge (i, j) in the distance matrix. Find the edge that created the feature by looking at the distance matrix.
@@ -102,6 +118,7 @@ class TopologySignatureLoss(nn.Module):
             Compute persistence loss between two tensors. Where y_X and y_Z are the persistence index pairs. If y_X and y_Z are not provided, compute them from the distance matrices of X_tensor and Z_tensor respectively. If y_X and y_Z are provided, use them to compute the loss directly without recomputing the persistence pairs. This is useful for batch training where we want to compute the loss for each batch without recomputing the persistence pairs for the whole dataset.
         """
         # Normalize for both to make sure the consistency loss
+        # Normalize for both to make sure the consistency loss
         X_norm = nn.functional.normalize(X_tensor, dim=0) / prod(s for s in X_tensor.shape[1:])
         Z_norm = nn.functional.normalize(Z_tensor, dim=0) / prod(s for s in Z_tensor.shape[1:])
 
@@ -114,14 +131,49 @@ class TopologySignatureLoss(nn.Module):
         if y_Z is None:
             y_Z = self._get_indices_pairs(mZ)
 
-        # Compute distances for the minimum spanning trees
-        mX_yX = [mX[x, y] for x, y in y_X]
-        mX_yZ = [mX[x, y] for x, y in y_Z]
+        if len(y_X) == 0 or len(y_Z) == 0:
+            return torch.tensor(0.0, device=X_tensor.device)
 
-        mZ_yX = [mZ[x, y] for x, y in y_X]
-        mZ_yZ = [mZ[x, y] for x, y in y_Z]
+        # Extract the critical edges of mX and mZ w.r.t y_X
+        val_mX_yX = torch.stack([mX[x, y] for x, y in y_X])
+        val_mZ_yX = torch.stack([mZ[x, y] for x, y in y_X])
 
-        loss = 1/2 * sum((x - y)**2 for x, y in zip(mX_yX, mX_yZ)) + sum((x - y)**2 for x, y in zip(mZ_yZ, mZ_yX))
-        
+        # Extract the critical edges of mX and mZ w.r.t y_Z
+        val_mX_yZ = torch.stack([mX[x, y] for x, y in y_Z])
+        val_mZ_yZ = torch.stack([mZ[x, y] for x, y in y_Z])
+
+        if len(y_X) == 0 or len(y_Z) == 0:
+            return torch.tensor(0.0, device=X_tensor.device)
+
+        if self.loss_type == "MSE":
+            loss = torch.sum((val_mX_yX - val_mZ_yX) ** 2) + torch.sum((val_mX_yZ - val_mZ_yZ) ** 2)
+        elif self.loss_type == "Log-Ratio":
+            loss_part1 = torch.sum((torch.log(val_mX_yX + EPS) - torch.log(val_mZ_yX + EPS)) ** 2)
+            loss_part2 = torch.sum((torch.log(val_mX_yZ + EPS) - torch.log(val_mZ_yZ + EPS)) ** 2)
+            loss = loss_part1 + loss_part2
+        elif self.loss_type == "Cosine-Log":
+            sim_mX_yX = torch.exp(-val_mX_yX)
+            sim_mZ_yX = torch.exp(-val_mZ_yX)
+            sim_mX_yZ = torch.exp(-val_mX_yZ)
+            sim_mZ_yZ = torch.exp(-val_mZ_yZ)
+            
+            # 2. Compute the logarithmic binary cross-entropy alignment
+            loss_part1 = -torch.sum(sim_mX_yX * torch.log(sim_mZ_yX + EPS) + (1.0 - sim_mX_yX) * torch.log(1.0 - sim_mZ_yX + EPS))
+            loss_part2 = -torch.sum(sim_mX_yZ * torch.log(sim_mZ_yZ + EPS) + (1.0 - sim_mX_yZ) * torch.log(1.0 - sim_mZ_yZ + EPS))
+            
+            loss = loss_part1 + loss_part2
+
+        elif self.loss_type == "Topo-KL":
+            # 1. Compute the softmax of the negative distances
+            p_mX_yX = F.softmax(-val_mX_yX / T, dim=0)
+            p_mZ_yX = F.softmax(-val_mZ_yX / T, dim=0)
+            
+            p_mX_yZ = F.softmax(-val_mX_yZ / T, dim=0)
+            p_mZ_yZ = F.softmax(-val_mZ_yZ / T, dim=0)
+            loss_part1 = symmetric_kl(p_mX_yX, p_mZ_yX)
+            loss_part2 = symmetric_kl(p_mX_yZ, p_mZ_yZ)
+            
+            loss = loss_part1 + loss_part2
+
         # Normalized by batch size and multiply by the product of the shape of Z_tensor except the batch size
-        return loss
+        return loss / X_tensor.shape[0] * prod(s for s in Z_tensor.shape[1:])
